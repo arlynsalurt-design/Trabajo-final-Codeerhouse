@@ -1,0 +1,378 @@
+{
+  "name": "Yazel Pay - Escenario 1 - Clasificacion y propuesta",
+  "description": "Recibe un lead, valida datos, busca el producto, crea el lead, consulta RAG, clasifica con Claude y genera una propuesta para leads ALTO o VIP.",
+  "blueprint_type": "make_reference_template",
+  "version": 1,
+  "connections_required": [
+    "Airtable",
+    "Anthropic Claude",
+    "Slack"
+  ],
+  "variables": {
+    "AIRTABLE_BASE_ID": "__AIRTABLE_BASE_ID__",
+    "TABLE_LEADS": "Leads",
+    "TABLE_PRODUCTS": "Productos",
+    "TABLE_RAG": "RAG",
+    "TABLE_PROPOSALS": "Propuestas",
+    "TABLE_ERRORS": "Errores",
+    "TABLE_EXECUTIONS": "Ejecuciones",
+    "SLACK_CHANNEL_ID": "__SLACK_CHANNEL_ID__",
+    "CLAUDE_MODEL": "claude-haiku-4-5"
+  },
+  "flow": [
+    {
+      "id": 1,
+      "module": "webhooks:customWebhook",
+      "label": "Trigger - Nuevo lead",
+      "mapper": {
+        "hook": "__WEBHOOK_ID__"
+      },
+      "output_schema": {
+        "lead_id_external": "text",
+        "nombre": "text",
+        "empresa": "text",
+        "email": "email",
+        "telefono": "text",
+        "necesidad": "text",
+        "presupuesto_estimado_usd": "number",
+        "volumen_mensual_transacciones": "number",
+        "producto_interes": "text"
+      },
+      "next": 2
+    },
+    {
+      "id": 2,
+      "module": "builtin:router",
+      "label": "Router - Validacion de datos",
+      "routes": [
+        {
+          "name": "Datos validos",
+          "filter": {
+            "logic": "AND",
+            "conditions": [
+              { "left": "{{1.nombre}}", "operator": "exists" },
+              { "left": "{{1.empresa}}", "operator": "exists" },
+              { "left": "{{1.email}}", "operator": "exists" },
+              { "left": "{{1.necesidad}}", "operator": "exists" },
+              { "left": "{{1.producto_interes}}", "operator": "exists" }
+            ]
+          },
+          "next": 3
+        },
+        {
+          "name": "Datos incompletos",
+          "filter": {
+            "logic": "OR",
+            "conditions": [
+              { "left": "{{1.email}}", "operator": "not_exists" },
+              { "left": "{{1.necesidad}}", "operator": "not_exists" },
+              { "left": "{{1.producto_interes}}", "operator": "not_exists" }
+            ]
+          },
+          "next": 20
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "module": "airtable:searchRecords",
+      "label": "Buscar producto",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Productos",
+        "limit": 1
+      },
+      "mapper": {
+        "formula": "AND({Activo}=1,LOWER({Nombre producto})=LOWER(\"{{1.producto_interes}}\"))"
+      },
+      "filter_after": {
+        "left": "{{3.record_id}}",
+        "operator": "exists"
+      },
+      "next": 4,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 4,
+      "module": "airtable:createRecord",
+      "label": "Crear Lead",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Leads"
+      },
+      "mapper": {
+        "Nombre": "{{1.nombre}}",
+        "Empresa": "{{1.empresa}}",
+        "Email": "{{1.email}}",
+        "Telefono": "{{1.telefono}}",
+        "Necesidad declarada": "{{1.necesidad}}",
+        "Presupuesto estimado": "{{1.presupuesto_estimado_usd}}",
+        "Volumen transacciones": "{{1.volumen_mensual_transacciones}}",
+        "Producto de interes": ["{{3.record_id}}"],
+        "Estado Lead": "Procesando IA",
+        "ID externo": "{{1.lead_id_external}}"
+      },
+      "next": 5,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 5,
+      "module": "airtable:searchRecords",
+      "label": "Consultar base RAG",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "RAG",
+        "limit": 50
+      },
+      "mapper": {
+        "formula": "AND({Activo}=1,{Estado de revision}=\"Vigente\")"
+      },
+      "next": 6,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 6,
+      "module": "builtin:textAggregator",
+      "label": "Agregar contexto RAG",
+      "parameters": { "source_module": 5 },
+      "mapper": {
+        "row_template": "TEMA: {{5.Tema}}\nCATEGORIA: {{5.Categoria}}\nCONTENIDO: {{5.Contenido atomico}}",
+        "separator": "\n---\n"
+      },
+      "next": 7
+    },
+    {
+      "id": 7,
+      "module": "anthropic:createMessage",
+      "label": "Claude Haiku - Clasificacion",
+      "parameters": {
+        "connection": "__ANTHROPIC_CONNECTION__",
+        "model": "claude-haiku-4-5",
+        "max_tokens": 500,
+        "temperature": 0.1
+      },
+      "mapper": {
+        "prompt": "Actua como analista comercial de Yazel Pay. Analiza el lead usando solo sus datos y el contexto privado. Nombre: {{1.nombre}}. Empresa: {{1.empresa}}. Necesidad: {{1.necesidad}}. Presupuesto: {{1.presupuesto_estimado_usd}}. Volumen: {{1.volumen_mensual_transacciones}}. Producto: {{1.producto_interes}}. <RAG_CONTEXT>{{6.text}}</RAG_CONTEXT> Selecciona exactamente una clasificacion: BAJO, MEDIO, ALTO o VIP. Devuelve exclusivamente JSON valido con clasificacion, score numerico, producto_recomendado, justificacion y requiere_revision booleano. General no es un producto y nunca debe recomendarse."
+      },
+      "next": 8,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 8,
+      "module": "builtin:setVariable",
+      "label": "Limpiar JSON clasificacion",
+      "mapper": {
+        "name": "classification_json",
+        "value": "{{trim(replace(replace(7.text; \"```json\"; \"\"); \"```\"; \"\"))}}"
+      },
+      "next": 9
+    },
+    {
+      "id": 9,
+      "module": "json:parseJSON",
+      "label": "Parse JSON - Clasificacion",
+      "parameters": {
+        "data_structure": {
+          "clasificacion": "text",
+          "score": "number",
+          "producto_recomendado": "text",
+          "justificacion": "text",
+          "requiere_revision": "boolean"
+        }
+      },
+      "mapper": { "json": "{{8.classification_json}}" },
+      "next": 10,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 10,
+      "module": "airtable:updateRecord",
+      "label": "Guardar clasificacion",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Leads"
+      },
+      "mapper": {
+        "record_id": "{{4.record_id}}",
+        "Clasificacion": "{{9.clasificacion}}",
+        "Score": "{{9.score}}",
+        "Justificacion IA": "{{9.justificacion}}",
+        "Requiere revision": "{{9.requiere_revision}}",
+        "Estado Lead": "Calificado"
+      },
+      "next": 11,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 11,
+      "module": "builtin:router",
+      "label": "Router - Clasificacion",
+      "routes": [
+        {
+          "name": "BAJO o MEDIO",
+          "filter": {
+            "logic": "OR",
+            "conditions": [
+              { "left": "{{9.clasificacion}}", "operator": "equal", "right": "BAJO" },
+              { "left": "{{9.clasificacion}}", "operator": "equal", "right": "MEDIO" }
+            ]
+          },
+          "next": 18
+        },
+        {
+          "name": "ALTO o VIP",
+          "filter": {
+            "logic": "OR",
+            "conditions": [
+              { "left": "{{9.clasificacion}}", "operator": "equal", "right": "ALTO" },
+              { "left": "{{9.clasificacion}}", "operator": "equal", "right": "VIP" }
+            ]
+          },
+          "next": 12
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "module": "anthropic:createMessage",
+      "label": "Claude Haiku - Propuesta",
+      "parameters": {
+        "connection": "__ANTHROPIC_CONNECTION__",
+        "model": "claude-haiku-4-5",
+        "max_tokens": 900,
+        "temperature": 0.2
+      },
+      "mapper": {
+        "prompt": "Actua como asesor comercial de Yazel Pay. Redacta un correo de propuesta profesional para {{1.nombre}} de {{1.empresa}}, usando el producto {{1.producto_interes}}, la necesidad {{1.necesidad}} y exclusivamente el contexto <RAG_CONTEXT>{{6.text}}</RAG_CONTEXT>. No inventes tarifas ni beneficios. Devuelve solamente JSON valido con email_subject, email_body, requires_human_review y missing_information como arreglo de textos. Usa \\n para saltos de linea dentro de email_body."
+      },
+      "next": 13,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 13,
+      "module": "builtin:setVariable",
+      "label": "Limpiar JSON propuesta",
+      "mapper": {
+        "name": "proposal_json",
+        "value": "{{trim(replace(replace(12.text; \"```json\"; \"\"); \"```\"; \"\"))}}"
+      },
+      "next": 14
+    },
+    {
+      "id": 14,
+      "module": "json:parseJSON",
+      "label": "Parse JSON - Propuesta",
+      "parameters": {
+        "data_structure": {
+          "email_subject": "text",
+          "email_body": "text",
+          "requires_human_review": "boolean",
+          "missing_information": "array[text]"
+        }
+      },
+      "mapper": { "json": "{{13.proposal_json}}" },
+      "next": 15,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 15,
+      "module": "airtable:createRecord",
+      "label": "Guardar propuesta",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Propuestas"
+      },
+      "mapper": {
+        "Lead": ["{{4.record_id}}"],
+        "Producto": ["{{3.record_id}}"],
+        "Asunto del correo": "{{14.email_subject}}",
+        "Borrador IA": "{{14.email_body}}",
+        "Estado Propuesta": "Pendiente de aprobacion",
+        "Aprobado": false
+      },
+      "next": 16,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 16,
+      "module": "airtable:updateRecord",
+      "label": "Lead - Con propuesta",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Leads"
+      },
+      "mapper": {
+        "record_id": "{{4.record_id}}",
+        "Propuestas": ["{{15.record_id}}"],
+        "Estado Lead": "Con propuesta"
+      },
+      "next": 17,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 17,
+      "module": "slack:createMessage",
+      "label": "Slack - Solicitar revision humana",
+      "parameters": {
+        "connection": "__SLACK_CONNECTION__",
+        "channel": "__SLACK_CHANNEL_ID__"
+      },
+      "mapper": {
+        "text": "Nueva propuesta pendiente de aprobacion para {{1.empresa}}. Clasificacion: {{9.clasificacion}}. Revise el registro de Airtable y marque Aprobado para autorizar el envio. Propuesta ID: {{15.record_id}}"
+      },
+      "next": 18,
+      "error_handler": { "next": 18, "directive": "resume" }
+    },
+    {
+      "id": 18,
+      "module": "airtable:createRecord",
+      "label": "Registrar metricas escenario 1",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Ejecuciones"
+      },
+      "mapper": {
+        "Fecha y hora": "{{now}}",
+        "Escenario": "Escenario 1",
+        "Ruta": "{{9.clasificacion}}",
+        "Resultado": "Exito",
+        "Lead": ["{{4.record_id}}"],
+        "Producto": ["{{3.record_id}}"],
+        "Propuesta": ["{{15.record_id}}"],
+        "Clasificacion": "{{9.clasificacion}}",
+        "Tokens entrada": "{{add(ifempty(7.usage.input_tokens;0);ifempty(12.usage.input_tokens;0))}}",
+        "Tokens salida": "{{add(ifempty(7.usage.output_tokens;0);ifempty(12.usage.output_tokens;0))}}",
+        "Modelo IA": "Claude Haiku 4.5",
+        "Modalidad": "Estandar"
+      },
+      "error_handler": { "directive": "resume" }
+    },
+    {
+      "id": 20,
+      "module": "airtable:createRecord",
+      "label": "Registrar error escenario 1",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Errores"
+      },
+      "mapper": {
+        "Fecha y hora": "{{now}}",
+        "Escenario": "Escenario 1",
+        "Modulo": "{{error.module}}",
+        "Codigo de error": "{{error.code}}",
+        "Mensaje de error": "{{error.message}}",
+        "Estado Ejecucion": "Error",
+        "Lead": ["{{ifempty(4.record_id;emptystring)}}"]
+      },
+      "directive": "break"
+    }
+  ],
+  "implementation_notes": [
+    "Los nombres de campos deben coincidir exactamente con Airtable.",
+    "Los campos vinculados Lead, Producto y Propuesta deben recibir record IDs rec..., nunca nombres.",
+    "Quite los elementos vinculados vacios para evitar el error [422] Value null is not a valid record ID.",
+    "Seleccione las opciones Single select desde Airtable sin comillas ni barras.",
+    "El modulo de metricas de la ruta BAJO/MEDIO debe omitir la propuesta si no existe; ajuste ese campo en Make.",
+    "Exporte desde Make el blueprint definitivo despues de remapear y probar todas las conexiones."
+  ]
+}

@@ -1,0 +1,262 @@
+{
+  "name": "Yazel Pay - Escenario 2 - HITL y envio",
+  "description": "Detecta propuestas aprobadas por una persona, valida el HITL y el anti-bucle, envia el correo por Gmail y actualiza estados y metricas.",
+  "blueprint_type": "make_reference_template",
+  "version": 1,
+  "connections_required": [
+    "Airtable",
+    "Gmail",
+    "Slack"
+  ],
+  "variables": {
+    "AIRTABLE_BASE_ID": "__AIRTABLE_BASE_ID__",
+    "TABLE_PROPOSALS": "Propuestas",
+    "TABLE_LEADS": "Leads",
+    "TABLE_ERRORS": "Errores",
+    "TABLE_EXECUTIONS": "Ejecuciones",
+    "AIRTABLE_VIEW": "Aprobados para enviar",
+    "SLACK_CHANNEL_ID": "__SLACK_CHANNEL_ID__"
+  },
+  "flow": [
+    {
+      "id": 1,
+      "module": "airtable:watchRecords",
+      "label": "Trigger - Propuestas aprobadas",
+      "parameters": {
+        "connection": "__AIRTABLE_CONNECTION__",
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Propuestas",
+        "view": "Aprobados para enviar",
+        "trigger_field": "Ultima modificacion",
+        "label_field": "Nombre de propuesta",
+        "limit": 10,
+        "start_from": "from_now_on"
+      },
+      "next": 2
+    },
+    {
+      "id": 2,
+      "module": "airtable:getRecord",
+      "label": "Get Proposal",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Propuestas"
+      },
+      "mapper": { "record_id": "{{1.record_id}}" },
+      "next": 3,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 3,
+      "module": "airtable:getRecord",
+      "label": "Get Lead",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Leads"
+      },
+      "mapper": { "record_id": "{{first(2.Lead)}}" },
+      "next": 4,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 4,
+      "module": "builtin:filter",
+      "label": "HITL - Aprobacion humana y anti-bucle",
+      "filter": {
+        "logic": "AND",
+        "conditions": [
+          { "left": "{{2.Aprobado}}", "operator": "boolean_equal", "right": true },
+          { "left": "{{2.Estado Propuesta}}", "operator": "equal", "right": "Pendiente de aprobacion" },
+          { "left": "{{2.Gmail Thread ID}}", "operator": "not_exists_or_empty" },
+          { "left": "{{3.Email}}", "operator": "exists" }
+        ]
+      },
+      "next": 5
+    },
+    {
+      "id": 5,
+      "module": "airtable:updateRecord",
+      "label": "Propuesta - Aprobada",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Propuestas"
+      },
+      "mapper": {
+        "record_id": "{{2.record_id}}",
+        "Estado Propuesta": "Aprobada",
+        "Fecha de aprobacion": "{{now}}"
+      },
+      "next": 6,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 6,
+      "module": "airtable:updateRecord",
+      "label": "Propuesta - Enviando",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Propuestas"
+      },
+      "mapper": {
+        "record_id": "{{2.record_id}}",
+        "Estado Propuesta": "Enviando"
+      },
+      "next": 7,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 7,
+      "module": "gmail:sendEmail",
+      "label": "Gmail - Enviar propuesta",
+      "parameters": {
+        "connection": "__GMAIL_CONNECTION__"
+      },
+      "mapper": {
+        "to": "{{3.Email}}",
+        "subject": "{{2.Asunto del correo}}",
+        "content": "{{ifempty(2.Version revisada;2.Borrador IA)}}",
+        "content_type": "text/plain"
+      },
+      "next": 8,
+      "error_handler": { "next": 21, "directive": "break" }
+    },
+    {
+      "id": 8,
+      "module": "airtable:updateRecord",
+      "label": "Propuesta - Enviada",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Propuestas"
+      },
+      "mapper": {
+        "record_id": "{{2.record_id}}",
+        "Estado Propuesta": "Enviada",
+        "Gmail Thread ID": "{{7.thread_id}}",
+        "Gmail Message ID": "{{7.message_id}}",
+        "Fecha de envio": "{{now}}"
+      },
+      "next": 9,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 9,
+      "module": "airtable:updateRecord",
+      "label": "Lead - Contactado",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Leads"
+      },
+      "mapper": {
+        "record_id": "{{3.record_id}}",
+        "Estado Lead": "Contactado"
+      },
+      "next": 10,
+      "error_handler": { "next": 20, "directive": "break" }
+    },
+    {
+      "id": 10,
+      "module": "slack:createMessage",
+      "label": "Slack - Confirmar envio",
+      "parameters": {
+        "connection": "__SLACK_CONNECTION__",
+        "channel": "__SLACK_CHANNEL_ID__"
+      },
+      "mapper": {
+        "text": "Propuesta enviada correctamente a {{3.Email}} para {{3.Empresa}}. Propuesta: {{2.Nombre de propuesta}}. Gmail Thread ID: {{7.thread_id}}"
+      },
+      "next": 11,
+      "error_handler": { "next": 11, "directive": "resume" }
+    },
+    {
+      "id": 11,
+      "module": "airtable:createRecord",
+      "label": "Registrar metricas escenario 2",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Ejecuciones"
+      },
+      "mapper": {
+        "Fecha y hora": "{{now}}",
+        "Escenario": "Escenario 2",
+        "Ruta": "Envio aprobado",
+        "Resultado": "Exito",
+        "Lead": ["{{3.record_id}}"],
+        "Propuesta": ["{{2.record_id}}"],
+        "Producto": "{{2.Producto}}",
+        "Mensaje": "Propuesta enviada y lead actualizado a Contactado"
+      },
+      "error_handler": { "directive": "resume" }
+    },
+    {
+      "id": 20,
+      "module": "airtable:createRecord",
+      "label": "Registrar error general escenario 2",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Errores"
+      },
+      "mapper": {
+        "Fecha y hora": "{{now}}",
+        "Escenario": "Escenario 2",
+        "Modulo": "{{error.module}}",
+        "Codigo de error": "{{error.code}}",
+        "Mensaje de error": "{{error.message}}",
+        "Estado Ejecucion": "Error",
+        "Lead": ["{{ifempty(3.record_id;emptystring)}}"],
+        "Propuesta": ["{{ifempty(2.record_id;emptystring)}}"]
+      },
+      "directive": "break"
+    },
+    {
+      "id": 21,
+      "module": "airtable:updateRecord",
+      "label": "Propuesta - Error de envio",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Propuestas"
+      },
+      "mapper": {
+        "record_id": "{{2.record_id}}",
+        "Estado Propuesta": "Error de envio"
+      },
+      "next": 22
+    },
+    {
+      "id": 22,
+      "module": "airtable:createRecord",
+      "label": "Registrar error Gmail",
+      "parameters": {
+        "base": "__AIRTABLE_BASE_ID__",
+        "table": "Errores"
+      },
+      "mapper": {
+        "Fecha y hora": "{{now}}",
+        "Escenario": "Escenario 2",
+        "Modulo": "Gmail - Enviar propuesta",
+        "Codigo de error": "{{error.code}}",
+        "Mensaje de error": "{{error.message}}",
+        "Estado Ejecucion": "Error",
+        "Lead": ["{{3.record_id}}"],
+        "Propuesta": ["{{2.record_id}}"]
+      },
+      "directive": "break"
+    }
+  ],
+  "airtable_view_definition": {
+    "name": "Aprobados para enviar",
+    "filters": [
+      { "field": "Aprobado", "condition": "checked" },
+      { "field": "Estado Propuesta", "condition": "equals", "value": "Pendiente de aprobacion" },
+      { "field": "Gmail Thread ID", "condition": "empty" }
+    ]
+  },
+  "implementation_notes": [
+    "El humano solo marca Aprobado; no cambia manualmente Estado Propuesta.",
+    "La misma ejecucion debe recorrer Aprobada, Enviando, Gmail, Enviada y Contactado.",
+    "Para probar, deje Pendiente de aprobacion, desmarque Aprobado, pulse Run once y luego marque el checkbox.",
+    "Si el campo Lead es un arreglo de objetos use get(first(2.Lead);\"id\") en vez de first(2.Lead).",
+    "Resultado y Estado Ejecucion deben ser opciones Single select preexistentes sin comillas.",
+    "No agregue Error Handler al modulo que registra errores para evitar bucles.",
+    "Exporte desde Make el blueprint definitivo despues de remapear y probar todas las conexiones."
+  ]
+}
